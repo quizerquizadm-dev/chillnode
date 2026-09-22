@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # RunPod serverless worker running UGC-VideoCaptioner-Abliterated
 # (Qwen2.5-Omni-3B based, handles image + video + audio in one model).
 #
@@ -29,7 +30,13 @@ RUN pip install --no-cache-dir \
 
 # Pre-download and cache the model weights into the image so a cold start
 # only has to load them from local disk, not from the internet.
-RUN python3 -c "\
+#
+# This model repo is gated on Hugging Face — from_pretrained() needs an
+# authenticated, access-approved token or it fails with exit code 1 before
+# it ever downloads a byte. We mount the token as a BuildKit secret (not
+# ENV/ARG) so it never gets baked into an image layer or build history.
+RUN --mount=type=secret,id=hf_token \
+    HF_TOKEN="$(cat /run/secrets/hf_token)" python3 -c "\
 from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor; \
 Qwen2_5OmniForConditionalGeneration.from_pretrained('MahouOfficial/UGC-VideoCaptioner-Abliterated'); \
 Qwen2_5OmniProcessor.from_pretrained('MahouOfficial/UGC-VideoCaptioner-Abliterated')"
