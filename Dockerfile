@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1
-# RunPod serverless worker running UGC-VideoCaptioner-Abliterated
-# (Qwen2.5-Omni-3B based, handles image + video + audio in one model).
+# RunPod serverless worker running Qwen3-VL-8B-Abliterated-Caption-it
+# (Qwen3-VL-8B based, handles image + video captioning, uncensored).
+# No audio understanding — this is a VL model, not an Omni model.
 #
 # Build & push:
 #   docker build -t <your-dockerhub-username>/vision-worker:latest .
@@ -15,31 +16,32 @@ FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 
 WORKDIR /app
 
-# transformers==4.52.3 is the version the model card itself specifies —
-# keep this pin exact. The rest are left loose since torch/runpod already
-# ship in the base image or aren't version-sensitive for this use case;
-# if the build fails on one of them, drop the pin for that package.
+# transformers==4.57.6 is required — Qwen3VLForConditionalGeneration does
+# not exist yet in the 4.52.x line this project started on. qwen-vl-utils
+# (not qwen-omni-utils) is the correct helper package for VL-family models;
+# it's what handles frame sampling for video input.
 RUN pip install --no-cache-dir \
     runpod \
-    transformers==4.52.3 \
+    transformers==4.57.6 \
     accelerate \
-    soundfile \
     decord \
-    qwen-omni-utils \
+    qwen-vl-utils \
     requests
 
 # Pre-download and cache the model weights into the image so a cold start
 # only has to load them from local disk, not from the internet.
 #
-# This model repo is gated on Hugging Face — from_pretrained() needs an
-# authenticated, access-approved token or it fails with exit code 1 before
-# it ever downloads a byte. We mount the token as a BuildKit secret (not
-# ENV/ARG) so it never gets baked into an image layer or build history.
+# This model repo is gated on Hugging Face (instant-accept: log in, click
+# Agree — not a manual-review queue) — from_pretrained() needs an
+# authenticated, access-approved token or it fails before downloading a
+# byte. We mount the token as a BuildKit secret (not ENV/ARG) so it never
+# gets baked into an image layer or build history.
 RUN --mount=type=secret,id=hf_token \
+    sh -c 'test -s /run/secrets/hf_token && echo "[hf_token] secret received, length=$(wc -c < /run/secrets/hf_token)" || echo "[hf_token] secret MISSING or empty — check the HF_TOKEN repo secret and the secrets: block in build.yml"' && \
     HF_TOKEN="$(cat /run/secrets/hf_token)" python3 -c "\
-from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor; \
-Qwen2_5OmniForConditionalGeneration.from_pretrained('MahouOfficial/UGC-VideoCaptioner-Abliterated'); \
-Qwen2_5OmniProcessor.from_pretrained('MahouOfficial/UGC-VideoCaptioner-Abliterated')"
+from transformers import Qwen3VLForConditionalGeneration, AutoProcessor; \
+Qwen3VLForConditionalGeneration.from_pretrained('prithivMLmods/Qwen3-VL-8B-Abliterated-Caption-it'); \
+AutoProcessor.from_pretrained('prithivMLmods/Qwen3-VL-8B-Abliterated-Caption-it')"
 
 COPY handler.py /app/handler.py
 
