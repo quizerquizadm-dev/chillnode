@@ -1,0 +1,46 @@
+name: Build and push vision-worker image
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:   # lets you also trigger it manually from the Actions tab
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write    # needed to push to ghcr.io
+
+    steps:
+      - name: Free up disk space
+        # Default free runners only have ~14GB usable — this reclaims 30GB+
+        # by stripping pre-installed tools we don't need (Android SDK, .NET,
+        # Haskell, etc.), which our multi-GB model image would otherwise
+        # blow through mid-build.
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}   # auto-provided, no setup needed
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/vision-worker:latest
