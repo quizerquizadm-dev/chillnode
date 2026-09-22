@@ -39,10 +39,11 @@ RUN pip install --no-cache-dir \
 RUN --mount=type=secret,id=hf_token \
     sh -c 'test -s /run/secrets/hf_token && echo "[hf_token] secret received, length=$(wc -c < /run/secrets/hf_token)" || echo "[hf_token] secret MISSING or empty — check the HF_TOKEN repo secret and the secrets: block in build.yml"' && \
     HF_TOKEN="$(cat /run/secrets/hf_token)" python3 -c "\
+import os; \
 from huggingface_hub import snapshot_download; \
 snapshot_download( \
     repo_id='prithivMLmods/Qwen3-VL-8B-Abliterated-Caption-it', \
-    token='$HF_TOKEN', \
+    token=os.environ['HF_TOKEN'], \
     ignore_patterns=['*.bin', '*.pt', '*.onnx', '*.h5'], \
 )"
 
