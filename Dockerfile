@@ -16,24 +16,30 @@ FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 
 WORKDIR /app
 
-# ffmpeg (the CLI binary) is required by handler.py's video color-metadata
-# normalization step (_normalize_video) — it re-muxes every uploaded video
-# with explicit bt709 color tags before decoding, which is what fixes the
-# intermittent swscale EAGAIN failure seen on Telegram-relayed uploads.
-# This is the actual ffmpeg executable, independent of whatever libav*
-# PyAV/torchvision bundle for in-process decoding.
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
-
 # transformers==4.57.6 is required — Qwen3VLForConditionalGeneration does
 # not exist yet in the 4.52.x line this project started on. qwen-vl-utils
 # (not qwen-omni-utils) is the correct helper package for VL-family models;
 # it's what handles frame sampling for video input.
+#
+# torchcodec is required too, even though qwen-vl-utils already checks for
+# `decord`. The actual video decode that was failing (the swscale/EAGAIN
+# "Failed initializing scaling graph" crash) happens one step later, inside
+# processor()'s AutoVideoProcessor, which only knows about torchcodec vs.
+# the deprecated torchvision/PyAV fallback — it never sees decord at all.
+# Without torchcodec installed, that fast video processor silently falls
+# back to torchvision, which is the fragile path that was crashing.
+# Pinned to 0.0.3 to match this image's torch==2.4.0 (base image above) —
+# see https://github.com/pytorch/torchcodec#installing-torchcodec for the
+# torchcodec/torch compatibility table before bumping either version.
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN pip install --no-cache-dir \
     runpod \
     transformers==4.57.6 \
     accelerate \
     decord \
+    torchcodec==0.0.3 \
     qwen-vl-utils \
     requests
 
