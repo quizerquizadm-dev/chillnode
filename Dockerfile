@@ -16,6 +16,15 @@ FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 
 WORKDIR /app
 
+# ffmpeg (the CLI binary) is required by handler.py's video color-metadata
+# normalization step (_normalize_video) — it re-muxes every uploaded video
+# with explicit bt709 color tags before decoding, which is what fixes the
+# intermittent swscale EAGAIN failure seen on Telegram-relayed uploads.
+# This is the actual ffmpeg executable, independent of whatever libav*
+# PyAV/torchvision bundle for in-process decoding.
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 # transformers==4.57.6 is required — Qwen3VLForConditionalGeneration does
 # not exist yet in the 4.52.x line this project started on. qwen-vl-utils
 # (not qwen-omni-utils) is the correct helper package for VL-family models;
@@ -48,8 +57,5 @@ snapshot_download( \
 )"
 
 COPY handler.py /app/handler.py
-
-ARG GIT_SHA=unknown
-ENV GIT_SHA=$GIT_SHA
 
 CMD ["python3", "-u", "handler.py"]
