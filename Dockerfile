@@ -49,4 +49,7 @@ snapshot_download( \
 
 COPY handler.py /app/handler.py
 
+ARG GIT_SHA=unknown
+ENV GIT_SHA=$GIT_SHA
+
 CMD ["python3", "-u", "handler.py"]
