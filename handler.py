@@ -16,12 +16,14 @@ Expected input JSON (what the dashboard's vision_worker.py sends):
     "media_type": "image" | "video",
     "media_url":  "<https url the worker can download directly>",
     "title":       "...",
-    "description": "..."
+    "description": "...",
+    "prompt":         "<optional admin instructions from Settings page>",
+    "max_new_tokens": <optional int, 32-1024>
   }
 }
 
 Returns:
-  {"caption": "..."}   on success
+  {"caption": "...", "prompt_used": "..."}   on success
   {"error": "..."}     on failure (the dashboard treats this as a job
                         failure even though RunPod itself reports the
                         HTTP call as COMPLETED — see vision_worker.py's
@@ -100,6 +102,28 @@ def _download_to_tempfile(url: str, suffix: str) -> str:
         return f.name
 
 
+MAX_TOKENS_DEFAULT, MAX_TOKENS_MIN, MAX_TOKENS_MAX = 200, 32, 1024
+
+
+def _render_prompt(template: str, media_type: str, title: str, description: str) -> str:
+    """Fill {media_type}/{title}/{description} with plain string replacement
+    (NOT str.format) so any other curly braces the admin types — JSON
+    examples, etc. — can't crash the job with a KeyError."""
+    out = template
+    for key, value in (("{media_type}", media_type),
+                       ("{title}", title),
+                       ("{description}", description)):
+        out = out.replace(key, value)
+    return out
+
+
+def _clean_max_tokens(raw) -> int:
+    try:
+        return max(MAX_TOKENS_MIN, min(MAX_TOKENS_MAX, int(raw)))
+    except (TypeError, ValueError):
+        return MAX_TOKENS_DEFAULT
+
+
 def handler(event):
     inp = event.get("input") or {}
     media_type = inp.get("media_type")
@@ -117,9 +141,12 @@ def handler(event):
         suffix = ".mp4" if media_type == "video" else ".jpg"
         tmp_path = _download_to_tempfile(media_url, suffix)
 
-        prompt_text = PROMPT_TEMPLATE.format(
-            media_type=media_type, title=title, description=description
-        )
+        # Admin-written instructions (Settings page -> bot_settings ->
+        # vision_worker.py -> here). Blank/missing = built-in default.
+        custom_prompt = (inp.get("prompt") or "").strip()
+        template = custom_prompt or PROMPT_TEMPLATE
+        prompt_text = _render_prompt(template, media_type, title, description)
+        max_new_tokens = _clean_max_tokens(inp.get("max_new_tokens", MAX_TOKENS_DEFAULT))
         messages = [{
             "role": "user",
             "content": [
@@ -143,7 +170,7 @@ def handler(event):
         inputs = inputs.to(model.device).to(model.dtype)
 
         with torch.no_grad():
-            generated_ids = model.generate(**inputs, max_new_tokens=200)
+            generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
 
         # Slice off the input prompt tokens so we only decode the newly
         # generated caption, not the echoed-back prompt.
@@ -158,7 +185,14 @@ def handler(event):
         if not caption:
             return {"error": "Model returned an empty caption"}
 
-        return {"caption": caption}
+        # prompt_used is echoed back so you can verify in the RunPod console
+        # (job -> Output) that your Settings-page instructions really arrived.
+        return {
+            "caption": caption,
+            "prompt_used": prompt_text[:1500],
+            "custom_prompt": bool(custom_prompt),
+            "max_new_tokens": max_new_tokens,
+        }
 
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}\n{traceback.format_exc()[-800:]}"}
