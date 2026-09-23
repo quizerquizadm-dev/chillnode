@@ -31,6 +31,8 @@ Returns:
 """
 
 import os
+import re
+import subprocess
 import tempfile
 import traceback
 
@@ -105,16 +107,58 @@ def _download_to_tempfile(url: str, suffix: str) -> str:
 MAX_TOKENS_DEFAULT, MAX_TOKENS_MIN, MAX_TOKENS_MAX = 200, 32, 1024
 
 
-def _render_prompt(template: str, media_type: str, title: str, description: str) -> str:
-    """Fill {media_type}/{title}/{description} with plain string replacement
-    (NOT str.format) so any other curly braces the admin types — JSON
-    examples, etc. — can't crash the job with a KeyError."""
+def _render_prompt(template: str, media_type: str, title: str, description: str,
+                   duration: str = "unknown") -> str:
+    """Fill {media_type}/{title}/{description}/{duration} with plain string
+    replacement (NOT str.format) so any other curly braces the admin types —
+    JSON examples, etc. — can't crash the job with a KeyError."""
     out = template
     for key, value in (("{media_type}", media_type),
                        ("{title}", title),
-                       ("{description}", description)):
+                       ("{description}", description),
+                       ("{duration}", duration)):
         out = out.replace(key, value)
     return out
+
+
+def _video_duration_seconds(path: str):
+    """Exact clip length via ffprobe (ships with the ffmpeg already installed
+    in the Docker image). Returns float seconds, or None if it can't be read —
+    a probe failure must never fail the caption job."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=20,
+        )
+        value = float(out.stdout.strip())
+        return value if value > 0 else None
+    except Exception:
+        return None
+
+
+def _format_duration(seconds: float) -> str:
+    """12.4 -> '12 seconds', 1 -> '1 second', 65 -> '1 minute 5 seconds'."""
+    total = int(round(seconds))
+    if total < 1:
+        return "less than 1 second"
+    mins, secs = divmod(total, 60)
+    parts = []
+    if mins:
+        parts.append(f"{mins} minute{'s' if mins != 1 else ''}")
+    if secs:
+        parts.append(f"{secs} second{'s' if secs != 1 else ''}")
+    return " ".join(parts)
+
+
+def _caption_mentions_duration(caption: str, seconds: float, duration_text: str) -> bool:
+    """True if the model already worked the length into its description
+    ('12 seconds', '12-second', '12s', or the total seconds of a longer clip)."""
+    low = caption.lower()
+    if duration_text.lower() in low:
+        return True
+    total = int(round(seconds))
+    return bool(re.search(rf"\b{total}\s*-?\s*(s|sec|secs|second|seconds)\b", low))
 
 
 def _clean_max_tokens(raw) -> int:
@@ -145,7 +189,24 @@ def handler(event):
         # vision_worker.py -> here). Blank/missing = built-in default.
         custom_prompt = (inp.get("prompt") or "").strip()
         template = custom_prompt or PROMPT_TEMPLATE
-        prompt_text = _render_prompt(template, media_type, title, description)
+        # Videos: measure the real length so it can be put in the caption
+        # (and used as {duration} inside the admin's prompt).
+        duration_text = None
+        duration_secs = None
+        if media_type == "video":
+            duration_secs = _video_duration_seconds(tmp_path)
+            if duration_secs:
+                duration_text = _format_duration(duration_secs)
+        prompt_text = _render_prompt(template, media_type, title, description,
+                                     duration_text or "unknown")
+        # Works with the default AND any custom Settings prompt: tell the model
+        # the real length and ask it to include it in the description itself.
+        if duration_text:
+            prompt_text += (
+                f"\nThe video is exactly {duration_text} long. Mention this length "
+                f"naturally as part of your description (for example: \"In this "
+                f"{duration_text} clip, ...\")."
+            )
         max_new_tokens = _clean_max_tokens(inp.get("max_new_tokens", MAX_TOKENS_DEFAULT))
         messages = [{
             "role": "user",
@@ -185,6 +246,10 @@ def handler(event):
         if not caption:
             return {"error": "Model returned an empty caption"}
 
+                # Safety net: only if the model didn't mention the length itself.
+        if duration_text and not _caption_mentions_duration(caption, duration_secs, duration_text):
+            caption = f"This video is {duration_text} long. {caption}"
+
         # prompt_used is echoed back so you can verify in the RunPod console
         # (job -> Output) that your Settings-page instructions really arrived.
         return {
@@ -192,6 +257,7 @@ def handler(event):
             "prompt_used": prompt_text[:1500],
             "custom_prompt": bool(custom_prompt),
             "max_new_tokens": max_new_tokens,
+            "video_length": duration_text,
         }
 
     except Exception as e:
