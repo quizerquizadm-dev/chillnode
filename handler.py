@@ -31,24 +31,19 @@ import traceback
 import requests
 import runpod
 import torch
-from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
-from qwen_vl_utils import process_vision_info
+from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
+from qwen_omni_utils import process_mm_info
 
-MODEL_ID = "prithivMLmods/Qwen3-VL-8B-Abliterated-Caption-it"
+MODEL_ID = "MahouOfficial/UGC-VideoCaptioner-Abliterated"
 
 print("[handler] Loading model — this only happens once per cold start...")
-model = Qwen3VLForConditionalGeneration.from_pretrained(
+model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
     MODEL_ID,
     torch_dtype=torch.bfloat16,
     device_map="auto",
 )
-processor = AutoProcessor.from_pretrained(MODEL_ID)
+processor = Qwen2_5OmniProcessor.from_pretrained(MODEL_ID)
 print("[handler] Model loaded and ready.")
-
-# NOTE: Qwen3-VL is image+video only — no audio understanding. If a video
-# has meaningful dialogue/sound your captions need to reflect, that has to
-# come from a separate speech-to-text pass; this model will silently just
-# describe the visuals.
 
 PROMPT_TEMPLATE = (
     "Describe this {media_type} in 1-2 sentences covering the subject, setting, mood, "
@@ -59,12 +54,45 @@ PROMPT_TEMPLATE = (
 )
 
 
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# Some hosts (e.g. Wikimedia) reject requests with the default
+# python-requests User-Agent and return 403 Forbidden. A normal
+# browser-like UA is accepted almost everywhere, including
+# Telegram's api.telegram.org/file/... URLs.
+_DOWNLOAD_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "*/*",
+}
+
+_session = requests.Session()
+_retry = Retry(
+    total=3,
+    backoff_factor=1.5,          # 0s, 1.5s, 3s between retries
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET"],
+)
+_session.mount("https://", HTTPAdapter(max_retries=_retry))
+_session.mount("http://", HTTPAdapter(max_retries=_retry))
+
+
 def _download_to_tempfile(url: str, suffix: str) -> str:
-    resp = requests.get(url, timeout=60, stream=True)
+    resp = _session.get(
+        url,
+        timeout=(10, 60),   # (connect timeout, read timeout)
+        stream=True,
+        headers=_DOWNLOAD_HEADERS,
+        allow_redirects=True,
+    )
     resp.raise_for_status()
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
         for chunk in resp.iter_content(chunk_size=1 << 20):
-            f.write(chunk)
+            if chunk:
+                f.write(chunk)
         return f.name
 
 
@@ -97,25 +125,24 @@ def handler(event):
         }]
 
         text = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-        image_inputs, video_inputs = process_vision_info(messages)
+        use_audio = media_type == "video"
+        audios, images, videos = process_mm_info(messages, use_audio_in_video=use_audio)
         inputs = processor(
-            text=[text], images=image_inputs, videos=video_inputs,
-            return_tensors="pt", padding=True,
+            text=text, audio=audios, images=images, videos=videos,
+            return_tensors="pt", padding=True, use_audio_in_video=use_audio,
         )
-        inputs = inputs.to(model.device)
+        inputs = inputs.to(model.device).to(model.dtype)
 
         with torch.no_grad():
-            generated_ids = model.generate(**inputs, max_new_tokens=200)
+            out_ids, _ = model.generate(
+                **inputs, use_audio_in_video=use_audio, return_audio=False, max_new_tokens=200
+            )
 
-        # Trim off the echoed input tokens so we're left with just the
-        # newly generated caption (the standard Qwen-VL decode pattern).
-        trimmed_ids = [
-            out_ids[len(in_ids):]
-            for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-        ]
-        caption = processor.batch_decode(
-            trimmed_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
-        )[0].strip()
+        decoded = processor.batch_decode(out_ids, skip_special_tokens=True,
+                                          clean_up_tokenization_spaces=False)[0]
+        # The decoded text includes the prompt echoed back — keep only what
+        # comes after it (the actual generated caption).
+        caption = decoded.split(prompt_text)[-1].strip() if prompt_text in decoded else decoded.strip()
 
         if not caption:
             return {"error": "Model returned an empty caption"}
