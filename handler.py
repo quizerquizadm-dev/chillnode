@@ -6,6 +6,10 @@ endpoint has an active worker; RunPod scales the worker back to zero
 after the idle timeout you configure in the console — see the setup
 instructions).
 
+Model: prithivMLmods/Qwen3-VL-8B-Abliterated-Caption-it — a Qwen3-VL-8B
+fine-tune for uncensored image/video captioning. This is a VL model,
+not an Omni model: it does not understand audio.
+
 Expected input JSON (what the dashboard's vision_worker.py sends):
 {
   "input": {
@@ -31,18 +35,18 @@ import traceback
 import requests
 import runpod
 import torch
-from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
-from qwen_omni_utils import process_mm_info
+from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+from qwen_vl_utils import process_vision_info
 
-MODEL_ID = "MahouOfficial/UGC-VideoCaptioner-Abliterated"
+MODEL_ID = "prithivMLmods/Qwen3-VL-8B-Abliterated-Caption-it"
 
 print("[handler] Loading model — this only happens once per cold start...")
-model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
+model = Qwen3VLForConditionalGeneration.from_pretrained(
     MODEL_ID,
     torch_dtype=torch.bfloat16,
     device_map="auto",
 )
-processor = Qwen2_5OmniProcessor.from_pretrained(MODEL_ID)
+processor = AutoProcessor.from_pretrained(MODEL_ID)
 print("[handler] Model loaded and ready.")
 
 PROMPT_TEMPLATE = (
@@ -124,25 +128,32 @@ def handler(event):
             ],
         }]
 
-        text = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-        use_audio = media_type == "video"
-        audios, images, videos = process_mm_info(messages, use_audio_in_video=use_audio)
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        image_inputs, video_inputs = process_vision_info(messages)
         inputs = processor(
-            text=text, audio=audios, images=images, videos=videos,
-            return_tensors="pt", padding=True, use_audio_in_video=use_audio,
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
         )
+        # BatchFeature.to() only casts floating-point tensors (pixel_values,
+        # etc.) to the given dtype and leaves integer tensors (input_ids,
+        # attention_mask) untouched, so this is safe to chain.
         inputs = inputs.to(model.device).to(model.dtype)
 
         with torch.no_grad():
-            out_ids, _ = model.generate(
-                **inputs, use_audio_in_video=use_audio, return_audio=False, max_new_tokens=200
-            )
+            generated_ids = model.generate(**inputs, max_new_tokens=200)
 
-        decoded = processor.batch_decode(out_ids, skip_special_tokens=True,
-                                          clean_up_tokenization_spaces=False)[0]
-        # The decoded text includes the prompt echoed back — keep only what
-        # comes after it (the actual generated caption).
-        caption = decoded.split(prompt_text)[-1].strip() if prompt_text in decoded else decoded.strip()
+        # Slice off the input prompt tokens so we only decode the newly
+        # generated caption, not the echoed-back prompt.
+        generated_ids_trimmed = [
+            out_ids[len(in_ids):]
+            for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
+        caption = processor.batch_decode(
+            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )[0].strip()
 
         if not caption:
             return {"error": "Model returned an empty caption"}
