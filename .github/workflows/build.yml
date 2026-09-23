@@ -12,12 +12,14 @@ jobs:
       contents: read
       packages: write    # needed to push to ghcr.io
 
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/vision-worker
+
     steps:
       - name: Free up disk space
         # Default free runners only have ~14GB usable — this reclaims 30GB+
-        # by stripping pre-installed tools we don't need (Android SDK, .NET,
-        # Haskell, etc.), which our multi-GB model image would otherwise
-        # blow through mid-build.
+        # by stripping pre-installed tools we don't need, which our
+        # multi-GB model image would otherwise blow through mid-build.
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: true
@@ -31,6 +33,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Short commit SHA
+        id: vars
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -43,6 +52,25 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/vision-worker:latest
+          # :latest for convenience, :<short-sha> is what you put in RunPod
+          # so every deploy is a distinct, verifiable image.
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ steps.vars.outputs.short }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
           secrets: |
             hf_token=${{ secrets.HF_TOKEN }}
+          # Registry cache: the multi-GB model layer is reused, so a
+          # handler.py-only change rebuilds in ~1-2 min instead of
+          # re-downloading the model. mode=min reuses the layers already
+          # in the pushed image (no big extra storage). First build after
+          # adding this is still a full build.
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=min
+
+      - name: Print image to use in RunPod
+        run: |
+          echo "### Image built" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`${{ env.IMAGE }}:${{ steps.vars.outputs.short }}\`" >> "$GITHUB_STEP_SUMMARY"
