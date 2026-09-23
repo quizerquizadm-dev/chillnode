@@ -1,5 +1,5 @@
 """
-runpod_deploy/handler.py — RunPod serverless entrypoint.
+handler.py — RunPod serverless entrypoint.
 
 Loaded ONCE per cold start (model stays warm across jobs while the
 endpoint has an active worker; RunPod scales the worker back to zero
@@ -29,6 +29,17 @@ Returns:
 """
 
 import os
+
+# Printed FIRST, before any heavy import, so the RunPod logs always show
+# which build is running (GIT_SHA is baked in by the Dockerfile/build.yml).
+print(f"[handler] build={os.environ.get('GIT_SHA', 'unknown')[:7]} starting", flush=True)
+
+# The model weights are baked into the image, so never call out to the
+# Hugging Face Hub at runtime (the repo is gated; an online check without a
+# token can fail even though the files are already on disk). Set
+# HF_HUB_OFFLINE=0 on the endpoint if you ever want to override this.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
 import tempfile
 import traceback
 
@@ -36,18 +47,17 @@ import requests
 import runpod
 import torch
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
-from qwen_vl_utils import process_vision_info
 
 MODEL_ID = "prithivMLmods/Qwen3-VL-8B-Abliterated-Caption-it"
 
-print("[handler] Loading model — this only happens once per cold start...")
+print("[handler] Loading model — this only happens once per cold start...", flush=True)
 model = Qwen3VLForConditionalGeneration.from_pretrained(
     MODEL_ID,
-    torch_dtype=torch.bfloat16,
+    dtype=torch.bfloat16,
     device_map="auto",
 )
 processor = AutoProcessor.from_pretrained(MODEL_ID)
-print("[handler] Model loaded and ready.")
+print("[handler] Model loaded and ready.", flush=True)
 
 PROMPT_TEMPLATE = (
     "Describe this {media_type} in 1-2 sentences covering the subject, setting, mood, "
@@ -128,18 +138,19 @@ def handler(event):
             ],
         }]
 
-        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        image_inputs, video_inputs = process_vision_info(messages)
-        inputs = processor(
-            text=[text],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
+        # transformers (>=4.57) loads/samples the image or video itself, so
+        # qwen-vl-utils is no longer needed on this path.
+        inputs = processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
             return_tensors="pt",
         )
-        # BatchFeature.to() only casts floating-point tensors (pixel_values,
-        # etc.) to the given dtype and leaves integer tensors (input_ids,
-        # attention_mask) untouched, so this is safe to chain.
+        inputs.pop("token_type_ids", None)
+        # .to(device).to(dtype) only casts floating-point tensors
+        # (pixel_values, ...) and leaves integer ones (input_ids,
+        # attention_mask) untouched.
         inputs = inputs.to(model.device).to(model.dtype)
 
         with torch.no_grad():
